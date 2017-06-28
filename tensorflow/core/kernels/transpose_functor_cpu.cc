@@ -17,6 +17,8 @@ limitations under the License.
 
 #include "tensorflow/core/kernels/transpose_functor.h"
 
+#include "tensorflow/core/kernels/ops_util.h"
+
 namespace tensorflow {
 namespace internal {
 
@@ -24,13 +26,11 @@ template <typename Device, typename T>
 void TransposeSimple(const Device& d, const Tensor& in,
                      const gtl::ArraySlice<int32> perm, Tensor* out) {
   const int ndims = in.dims();
-  gtl::InlinedVector<int64, 8> in_strides(ndims);
-  ComputeStride(in.shape(), in_strides.data());
-  gtl::InlinedVector<int64, 8> out_strides(ndims);
-  ComputeStride(out->shape(), out_strides.data());
+  gtl::InlinedVector<int64, 8> in_strides = ComputeStride<int64>(in.shape());
+  gtl::InlinedVector<int64, 8> out_strides = ComputeStride<int64>(out->shape());
   const int64 nelem = in.NumElements();
-  const T* p = reinterpret_cast<const T*>(in.tensor_data().data());
-  T* q = reinterpret_cast<T*>(const_cast<char*>((out->tensor_data().data())));
+  const T* p = in.flat<T>().data();
+  T* q = out->flat<T>().data();
 
   // TODO(zhifengc): Shard by range.
   // TODO(zhifengc): Avoids the division.
@@ -43,20 +43,6 @@ void TransposeSimple(const Device& d, const Tensor& in,
     }
     q[o_idx] = p[i_idx];
   }
-}
-
-template <typename Device, typename T, int NDIMS>
-void TransposeUsingEigen(const Device& d, const Tensor& in,
-                         const gtl::ArraySlice<int32> perm, Tensor* out) {
-  Eigen::array<int, NDIMS> p;
-  for (int i = 0; i < NDIMS; ++i) p[i] = perm[i];
-  auto x = typename TTypes<T, NDIMS>::ConstTensor(
-      reinterpret_cast<const T*>(in.tensor_data().data()),
-      in.shape().AsEigenDSizes<NDIMS>());
-  auto y = typename TTypes<T, NDIMS>::Tensor(
-      reinterpret_cast<T*>(const_cast<char*>(out->tensor_data().data())),
-      out->shape().AsEigenDSizes<NDIMS>());
-  y.device(d) = x.shuffle(p);
 }
 
 }  // end namespace internal
@@ -118,13 +104,13 @@ Status DoTranspose<CPUDevice>(const CPUDevice& d, const Tensor& in,
     case DT_FLOAT:
     case DT_INT32:
     case DT_QINT32:
-      Transpose<Device, uint32>::run(d, in, perm, out);
+      Transpose<Device, int32>::run(d, in, perm, out);
       break;
 
     case DT_COMPLEX64:
     case DT_DOUBLE:
     case DT_INT64:
-      Transpose<Device, uint64>::run(d, in, perm, out);
+      Transpose<Device, int64>::run(d, in, perm, out);
       break;
 
     case DT_COMPLEX128:
@@ -213,13 +199,13 @@ Status DoTranspose<SYCLDevice>(const SYCLDevice& d, const Tensor& in,
     case DT_FLOAT:
     case DT_INT32:
     case DT_QINT32:
-      TransposeSYCL<SYCLDevice, uint32>(d, in, perm, out);
+      TransposeSYCL<SYCLDevice, int32>(d, in, perm, out);
       break;
 
     case DT_COMPLEX64:
     case DT_DOUBLE:
     case DT_INT64:
-      TransposeSYCL<SYCLDevice, uint64>(d, in, perm, out);
+      TransposeSYCL<SYCLDevice, int64>(d, in, perm, out);
       break;
 
     case DT_COMPLEX128:
