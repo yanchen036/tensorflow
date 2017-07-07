@@ -105,41 +105,21 @@ class GatherNdOp : public OpKernel {
                   errors::InvalidArgument("Requested more than 0 entries, but "
                                           "params is empty.  Params shape: ",
                                           params_shape.DebugString()));
-
-      auto indices_mat = indices.flat_inner_dims<Index>();
-
       Index bad_i = -1;
 
-      // Request to copy slices / subtensors
-      // Make out a matrix with the slices the col size.
-      auto out_mat = out->shaped<T, 2>({N_result, slice_size});
       Tensor scratch;
       OP_REQUIRES_OK(c, c->allocate_temp(DT_INT32, TensorShape(), &scratch));
-      auto scratch_scalar = scratch.scalar<int32>();
 
-      switch (indices_nd) {
-#define PARAMS_CASE(IXDIM)                                              \
-  case IXDIM: {                                                         \
-    functor::GatherNdSlice<Device, T, Index, IXDIM> func;               \
-    auto params_flat = params.flat_outer_dims<T, IXDIM + 1>();          \
-    bad_i = func(c->eigen_device<Device>(), slice_size, scratch_scalar, \
-                 params_flat, indices_mat, out_mat);                    \
-  } break
-        PARAMS_CASE(0);
-        PARAMS_CASE(1);
-        PARAMS_CASE(2);
-        PARAMS_CASE(3);
-        PARAMS_CASE(4);
-        PARAMS_CASE(5);
-#undef PARAMS_CASE
-        default:
-          OP_REQUIRES(c, false,
-                      errors::InvalidArgument(
-                          "Only indices.shape[-1] values between 1 and 5 "
-                          "are currently supported.  Requested rank: ",
-                          indices_nd));
+      if (indices_nd >= 0) {
+        bad_i = func(c->eigen_device<Device>(), N_result, slice_size,
+                     indices_nd, scratch, params, indices, out);
+      } else {
+        OP_REQUIRES(c, false,
+                    errors::InvalidArgument(
+                      "Only indices.shape[-1] values >= 0 "
+                      "are currently supported.  Requested rank: ",
+                      indices_nd));
       }
-
       // bad_i will only return >= 0 on CPUs right now.
       OP_REQUIRES(c, bad_i < 0,
                   errors::InvalidArgument(

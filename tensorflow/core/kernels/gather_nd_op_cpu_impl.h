@@ -36,7 +36,7 @@ namespace tensorflow {
 
 typedef Eigen::ThreadPoolDevice CPUDevice;
 
-namespace generator {
+namespace internal {
 
 template <typename T, typename Index, int IXDIM>
 class GatherNdSliceGenerator {
@@ -89,17 +89,12 @@ class GatherNdSliceGenerator {
   std::atomic<Index>* error_loc_;
 };
 
-}  // namespace generator
-
-namespace functor {
-
 template <typename T, typename Index, int IXDIM>
-struct GatherNdSlice<CPUDevice, T, Index, IXDIM> {
-  Index operator()(const CPUDevice& d, const Index slice_size,
-                   typename TTypes<int32>::Scalar Tscratch,
-                   typename TTypes<T, IXDIM + 1>::ConstTensor Tparams,
-                   typename TTypes<Index>::ConstMatrix Tindices,
-                   typename TTypes<T>::Matrix Tout) {
+Index GatherNdSliceUsingEigen(const CPUDevice& d, const Index slice_size,
+                             typename TTypes<int32>::Scalar Tscratch,
+                             typename TTypes<T, IXDIM + 1>::ConstTensor Tparams,
+                             typename TTypes<Index>::ConstMatrix Tindices,
+                             typename TTypes<T>::Matrix Tout) {
     std::atomic<Index> error_loc(-1);
 
     const Eigen::DenseIndex batch_size = Tindices.dimension(0);
@@ -111,7 +106,7 @@ struct GatherNdSlice<CPUDevice, T, Index, IXDIM> {
     Eigen::IndexList<Eigen::DenseIndex> broadcast_dims;
     broadcast_dims.set(0, batch_size);
 #endif
-    generator::GatherNdSliceGenerator<T, Index, IXDIM> gather_nd_generator(
+    GatherNdSliceGenerator<T, Index, IXDIM> gather_nd_generator(
         slice_size, Tindices, Tparams, Tout, &error_loc);
     Tscratch.device(d) = Tscratch.reshape(reshape_dims)
                              .broadcast(broadcast_dims)
@@ -121,16 +116,101 @@ struct GatherNdSlice<CPUDevice, T, Index, IXDIM> {
     // error_loc() returns -1 if there's no out-of-bounds index,
     // otherwise it returns the location of an OOB index in Tindices.
     return error_loc.load();
+}
+
+template <typename T, typename Index>
+void GatherNdSliceSimple(const GPUDevice& d, int ixdim,
+                         Tensor& scratch, const Tensor& params,
+                         const Tensor& indices, Tensor* out) {
+  const int64 indices_size = indices.dim_size(1);
+  const int64 out_size = out->NumElements();
+  int64 s_size = out->dim_size(1);
+  gtl::InlinedVector<int64, 8> batch_strides(ixdim);
+  gtl::InlinedVector<int64, 8> batch_indices(ixdim);
+  if (ixdim > 0) {
+    batch_strides[size_t(ixdim - 1)] = s_size;
+    batch_indices[size_t(ixdim - 1)] = params.dim_size(ixdim - 1);
+  }
+  for (int i = ixdim - 1; i > 0; --i) {
+    batch_indices[i - 1] = params.dim_size(i - 1);
+    batch_strides[i - 1] = batch_strides[i] * params.dim_size(i);
+  }
+  const T* param_data = params.flat<T>().data();
+  const T* indices_data = indices.flat<T>().data();
+  T* out_data = out->flat<T>().data();
+  for (int i = 0; i < out_size; ++i) {
+    const Index loc = i / slice_size;
+    const auto indices_i = indices_data + ixdim * loc;
+    bool out_of_bounds = false;
+    Index offset = 0;
+#pragma unroll
+    for (int j = 0; j < ixdim; ++j) {
+      const Index index_j = *(indices_i + j);
+      out_of_bounds |= !FastBoundsCheck(index_j, batch_indices[j]);
+      offset += batch_strides[j] * index_j;
+    }
+    const Index loc_offset = i - loc * slice_size;
+    out_data[i] = (out_of_bounds) ? T(0) : params_data[offset + loc_offset];
+  }
+  return -1;
+}
+
+}  // namespace internal
+
+namespace functor {
+
+template <typename T, typename Index>
+struct GatherNdSlice<CPUDevice, T, Index> {
+  Index operator()(const Device& d, const Index N_result,
+                   const Index slice_size, const int ixdim,
+                   Tensor& scratch, const Tensor& params,
+                   const Tensor& indices, Tensor* out) {
+    Index bad_i = -1;
+    if (ixdim <= 5) {
+      auto scratch_scalar = scratch.scalar<int32>();
+      auto params_flat = params.flat_outer_dims<T, ixdim + 1>();
+      auto indices_mat = indices.flat_inner_dims<Index>();
+      auto out_mat = auto->shaped<T, 2>({N_result, slice_size});
+      switch (ixdim) {
+        case 0:
+          bad_i = internal::GatherNdSliceUsingEigen<T, Index, 0>(
+              d, slice_size, scratch_scalar, params_flat, indices_mat, out_mat);
+          break;
+        case 1:
+          bad_i = internal::GatherNdSliceUsingEigen<T, Index, 1>(
+              d, slice_size, scratch_scalar, params_flat, indices_mat, out_mat);
+          break;
+        case 2:
+          bad_i = internal::GatherNdSliceUsingEigen<T, Index, 2>(
+              d, slice_size, scratch_scalar, params_flat, indices_mat, out_mat);
+          break;
+        case 3:
+          bad_i = internal::GatherNdSliceUsingEigen<T, Index, 3>(
+              d, slice_size, scratch_scalar, params_flat, indices_mat, out_mat);
+          break;
+        case 4:
+          bad_i = internal::GatherNdSliceUsingEigen<T, Index, 4>(
+              d, slice_size, scratch_scalar, params_flat, indices_mat, out_mat);
+          break;
+        case 5:
+          bad_i = internal::GatherNdSliceUsingEigen<T, Index, 5>(
+              d, slice_size, scratch_scalar, params_flat, indices_mat, out_mat);
+          break;
+      }
+    } else {
+      bad_i = internal::GatherNdSliceSimple<T, Index>(d, slice_size, ixdim, scratch,
+                                              params, indices, out);
+    }
+    return bad_i;
   }
 };
 
 #define REGISTER_GATHER_ND_FULL(T, Index)                                     \
-  template Index GatherNdSlice<CPUDevice, T, Index, CPU_PROVIDED_IXDIM>::     \
-  operator()(const CPUDevice& d, const Index slice_size,                      \
-             typename TTypes<int32>::Scalar Tscratch,                         \
-             typename TTypes<T, CPU_PROVIDED_IXDIM + 1>::ConstTensor Tparams, \
-             typename TTypes<Index>::ConstMatrix Tindices,                    \
-             typename TTypes<T>::Matrix Tout);
+  template Index GatherNdSlice<CPUDevice, T, Index>::                         \
+  operator()(const CPUDevice& d, const Index N_result,                        \
+             const Index slice_size, const int ixdim,                         \
+             Tensor& scratch, const Tensor& params,                           \
+             const Tensor& indices, Tensor* out);
 
 #define REGISTER_GATHER_ND_CPU(type)    \
   REGISTER_GATHER_ND_FULL(type, int32); \

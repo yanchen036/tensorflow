@@ -27,16 +27,15 @@ namespace tensorflow {
 class OpKernelContext;
 
 namespace functor {
-template <typename Device, typename T, typename Index, int IXDIM>
+template <typename Device, typename T, typename Index>
 struct GatherNdSlice {
   // Performs a slice gather op on (Tparams, Tindices), writing to Tout.
   // Returns an index to Tindices if the value at that index is out of range.
   // Returns -1 if all values of Tindices are in range.
-  Index operator()(const Device& d, const Index slice_size,
-                   typename TTypes<int32>::Scalar Tscratch,
-                   typename TTypes<T, IXDIM + 1>::ConstTensor Tparams,
-                   typename TTypes<Index>::ConstMatrix Tindices,
-                   typename TTypes<T>::Matrix Tout);
+  Index operator()(const Device& d, const Index N_result,
+                   const Index slice_size, const int ixdim,
+                   Tensor& scratch, const Tensor& params,
+                   const Tensor& indices, Tensor* out);
 };
 
 }  // namespace functor

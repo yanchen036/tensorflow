@@ -26,21 +26,22 @@ namespace tensorflow {
 
 typedef Eigen::GpuDevice GPUDevice;
 
-template <typename T, typename Index, int IXDIM>
+template <typename T, typename Index>
 __global__ void GatherSliceOpKernel(
     const T* params, const Index* indices, T* out,
-    const Eigen::array<int64, IXDIM> batch_strides,
-    const Eigen::array<int64, IXDIM> batch_indices, const int64 indices_size,
-    const int64 slice_size, const int64 out_size) {
+    const gtl::InlinedVector<int64, 8>& batch_strides,
+    const gtl::InlinedVector<int64, 8>& batch_indices,
+    const int64 indices_size, const int64 slice_size,
+    const int64 out_size, const int ixdim) {
   // TODO(ebrevdo): reduce inner loop into two loops:
   // one over the number of locs, and one over the offsets inside the locs.
   CUDA_1D_KERNEL_LOOP(i, out_size) {
     const Index loc = i / slice_size;
-    const auto indices_i = indices + IXDIM * loc;
+    const auto indices_i = indices + ixdim * loc;
     bool out_of_bounds = false;
     Index offset = 0;
 #pragma unroll
-    for (int j = 0; j < IXDIM; ++j) {
+    for (int j = 0; j < ixdim; ++j) {
       const Index index_j = ldg(indices_i + j);
       out_of_bounds |= !FastBoundsCheck(index_j, batch_indices[j]);
       offset += batch_strides[j] * index_j;
@@ -59,33 +60,33 @@ __global__ void GatherSliceOpKernel(
 
 namespace functor {
 
-template <typename T, typename Index, int IXDIM>
-struct GatherNdSlice<GPUDevice, T, Index, IXDIM> {
-  Index operator()(const GPUDevice& d, const Index unused_slice_size,
-                   typename TTypes<int32>::Scalar Tscratch,
-                   typename TTypes<T, IXDIM + 1>::ConstTensor Tparams,
-                   typename TTypes<Index>::ConstMatrix Tindices,
-                   typename TTypes<T>::Matrix Tout) {
-    const int64 indices_size = Tindices.dimension(1);
-    const int64 out_size = Tout.size();
-    int64 s_size = Tout.dimension(1);
-    Eigen::array<int64, IXDIM> batch_strides;
-    Eigen::array<int64, IXDIM> batch_indices;
-    if (IXDIM > 0) {
-      batch_strides[size_t(IXDIM - 1)] = s_size;
-      batch_indices[size_t(IXDIM - 1)] = Tparams.dimension(IXDIM - 1);
+template <typename T, typename Index>
+struct GatherNdSlice<GPUDevice, T, Index> {
+  Index operator()(const GPUDevice& d, const Index unused_N_result,
+                   const Index unused_slice_size, int ixdim,
+                   Tensor& scratch, const Tensor& params,
+                   const Tensor& indices, Tensor* out) {
+    const int64 indices_size = indices.dim_size(1);
+    const int64 out_size = out->NumElements();
+    int64 s_size = out->dim_size(1);
+    gtl::InlinedVector<int64, 8> batch_strides(ixdim);
+    gtl::InlinedVector<int64, 8> batch_indices(ixdim);
+    if (ixdim > 0) {
+      batch_strides[size_t(ixdim - 1)] = s_size;
+      batch_indices[size_t(ixdim - 1)] = params.dim_size(ixdim - 1);
     }
-    for (int i = IXDIM - 1; i > 0; --i) {
-      batch_indices[i - 1] = Tparams.dimension(i - 1);
-      batch_strides[i - 1] = batch_strides[i] * Tparams.dimension(i);
+    for (int i = ixdim - 1; i > 0; --i) {
+      batch_indices[i - 1] = params.dim_size(i - 1);
+      batch_strides[i - 1] = batch_strides[i] * params.dim_size(i);
     }
     CudaLaunchConfig config = GetCudaLaunchConfig(out_size, d);
 
     // clang-format off
-    GatherSliceOpKernel<T, Index, IXDIM>
+    GatherSliceOpKernel<T, Index>
         <<<config.block_count, config.thread_per_block, 0, d.stream()>>>(
-            Tparams.data(), Tindices.data(), Tout.data(), batch_strides,
-            batch_indices, indices_size, s_size, out_size);
+            params.flat<T>.data(), indices.flat<T>.data(),
+            out->flat<T>.data(), batch_strides, batch_indices,
+            indices_size, s_size, out_size, ixdim);
     // clang-format on
 
     // TODO(ebrevdo): enable indices validation on GPU.
@@ -97,16 +98,8 @@ struct GatherNdSlice<GPUDevice, T, Index, IXDIM> {
 
 }  // namespace functor
 
-#define DEFINE_GPU_SPECS_INDEX_NDIM(T, Index, NDIM) \
-  template struct functor::GatherNdSlice<GPUDevice, T, Index, NDIM>;
-
 #define DEFINE_GPU_SPECS_INDEX(T, Index)    \
-  DEFINE_GPU_SPECS_INDEX_NDIM(T, Index, 0); \
-  DEFINE_GPU_SPECS_INDEX_NDIM(T, Index, 1); \
-  DEFINE_GPU_SPECS_INDEX_NDIM(T, Index, 2); \
-  DEFINE_GPU_SPECS_INDEX_NDIM(T, Index, 3); \
-  DEFINE_GPU_SPECS_INDEX_NDIM(T, Index, 4); \
-  DEFINE_GPU_SPECS_INDEX_NDIM(T, Index, 5);
+  template struct functor::GatherNdSlice<GPUDevice, T, Index>;
 
 #define DEFINE_GPU_SPECS(T)         \
   DEFINE_GPU_SPECS_INDEX(T, int32); \
